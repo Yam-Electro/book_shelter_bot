@@ -1,0 +1,31 @@
+services:
+  proxy:
+    build:
+      context: ./proxy
+    env_file:
+      - .env
+    restart: unless-stopped
+    expose:
+      - "1080"
+
+  bot:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      LIBRARY_DIR: /books
+      DATA_DIR: /data
+      SOCKS_PROXY: socks5://proxy:1080
+    volumes:
+      - books:/books:ro
+      - catalog-data:/data
+    depends_on:
+      proxy:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  catalog-data:
+  books:
+    name: book_shelter_bot_books
