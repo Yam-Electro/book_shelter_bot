@@ -27,16 +27,19 @@ def vless_to_xray(url: str) -> dict:
     q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
     flow = q.get("flow", "")
     network = q.get("type", "tcp")
+    if network == "tcp":
+        network = "raw"
     security = q.get("security", "reality")
-    stream: dict = {"network": network, "security": security}
+    stream: dict = {"network": network, "method": network, "security": security}
+    pbk = q.get("pbk") or q.get("password") or ""
     if security == "reality":
         stream["realitySettings"] = {
-            "show": False,
             "fingerprint": q.get("fp", "chrome"),
             "serverName": q.get("sni") or q.get("serverName") or host,
-            "publicKey": q.get("pbk", ""),
+            "password": pbk,
+            "publicKey": pbk,
             "shortId": q.get("sid", ""),
-            "spiderX": q.get("spx", "/"),
+            "spiderX": q.get("spx") or "",
         }
     elif security == "tls":
         stream["tlsSettings"] = {
@@ -44,7 +47,7 @@ def vless_to_xray(url: str) -> dict:
             "fingerprint": q.get("fp", "chrome"),
             "allowInsecure": False,
         }
-    user = {"id": uuid, "encryption": "none"}
+    user = {"id": uuid, "encryption": q.get("encryption", "none")}
     if flow:
         user["flow"] = flow
     return {

@@ -104,6 +104,9 @@ class Catalog:
                 series,
                 tokenize = 'unicode61'
             );
+            CREATE INDEX IF NOT EXISTS books_archive ON books(archive);
+            CREATE INDEX IF NOT EXISTS books_author ON books(author);
+            CREATE INDEX IF NOT EXISTS books_title ON books(title);
             """
         )
         self.conn.commit()
@@ -236,6 +239,97 @@ class Catalog:
             ).fetchall()
         return [self._book(r) for r in rows]
 
+    def _local_filter(self) -> tuple[str, tuple[str, ...]]:
+        archives = tuple(sorted(self.available_archives()))
+        if not archives:
+            return "", ()
+        placeholders = ",".join("?" * len(archives))
+        return f"deleted = 0 AND archive IN ({placeholders})", archives
+
+    def local_counts(self) -> tuple[int, int]:
+        where, params = self._local_filter()
+        if not where:
+            return 0, 0
+        books = self.conn.execute(
+            f"SELECT COUNT(*) FROM books WHERE {where}", params
+        ).fetchone()[0]
+        authors = self.conn.execute(
+            f"SELECT COUNT(DISTINCT author) FROM books WHERE {where} AND author != ''",
+            params,
+        ).fetchone()[0]
+        return books, authors
+
+    def local_letters(self, field: str) -> list[str]:
+        where, params = self._local_filter()
+        if not where or field not in {"author", "title"}:
+            return []
+        rows = self.conn.execute(
+            f"SELECT DISTINCT {field} FROM books WHERE {where}",
+            params,
+        ).fetchall()
+        letters = {_first_letter(value or "") for (value,) in rows}
+        order = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ#"
+        return [ch for ch in order if ch in letters]
+
+    def local_authors(self, letter: str, offset: int, limit: int) -> tuple[list[tuple[str, int]], int]:
+        where, params = self._local_filter()
+        if not where:
+            return [], 0
+        extra, extra_params = _letter_sql("author", letter)
+        rows = self.conn.execute(
+            f"""
+            SELECT author, COUNT(*) AS n
+            FROM books
+            WHERE {where} AND author != '' AND {extra}
+            GROUP BY author
+            ORDER BY author COLLATE NOCASE
+            """,
+            (*params, *extra_params),
+        ).fetchall()
+        authors = [
+            (row["author"], row["n"])
+            for row in rows
+            if _first_letter(row["author"]) == letter
+        ]
+        return authors[offset : offset + limit], len(authors)
+
+    def local_books_by_author(self, author: str, offset: int, limit: int) -> tuple[list[Book], int]:
+        where, params = self._local_filter()
+        if not where:
+            return [], 0
+        total = self.conn.execute(
+            f"SELECT COUNT(*) FROM books WHERE {where} AND author = ?",
+            (*params, author),
+        ).fetchone()[0]
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM books
+            WHERE {where} AND author = ?
+            ORDER BY title COLLATE NOCASE, file_id
+            LIMIT ? OFFSET ?
+            """,
+            (*params, author, limit, offset),
+        ).fetchall()
+        return [self._book(row) for row in rows], total
+
+    def local_books_by_title_letter(self, letter: str, offset: int, limit: int) -> tuple[list[Book], int]:
+        where, params = self._local_filter()
+        if not where:
+            return [], 0
+        extra, extra_params = _letter_sql("title", letter)
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM books
+            WHERE {where} AND {extra}
+            ORDER BY title COLLATE NOCASE, file_id
+            """,
+            (*params, *extra_params),
+        ).fetchall()
+        books = [
+            self._book(row) for row in rows if _first_letter(row["title"] or "") == letter
+        ]
+        return books[offset : offset + limit], len(books)
+
     def extract(self, book: Book) -> bytes:
         archive_path = self.library_dir / book.archive
         if not archive_path.is_file():
@@ -262,6 +356,19 @@ class Catalog:
             lang=row["lang"] or "",
             deleted=row["deleted"] or 0,
         )
+
+
+def _letter_sql(field: str, letter: str) -> tuple[str, tuple]:
+    if letter == "#":
+        return "1 = 1", ()
+    return f"({field} LIKE ? OR {field} LIKE ?)", (f"{letter}%", f"{letter.lower()}%")
+
+
+def _first_letter(value: str) -> str:
+    ch = (value or "").strip()[:1].upper()
+    if ch.isalpha():
+        return ch
+    return "#"
 
 
 def _to_fts_query(raw: str) -> str:
