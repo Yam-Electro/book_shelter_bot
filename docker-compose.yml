@@ -1,3 +1,5 @@
+# proxy is always started. If VLESS_URL is empty it stays idle and the bot
+# connects to Telegram without SOCKS.
 services:
   proxy:
     build:
