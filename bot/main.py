@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -20,6 +20,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+from bot.access import Access, AccessMiddleware, parse_username_arg
 from bot.catalog import PAGE_SIZE, Book, Catalog
 
 load_dotenv()
@@ -40,6 +41,17 @@ def env(*names: str, default: str | None = None) -> str | None:
         if value:
             return value.strip().strip('"')
     return default
+
+
+def collect_admins() -> list[str]:
+    names: list[str] = []
+    for key, value in os.environ.items():
+        if not key.startswith("ADMIN") or "USERNAME" not in key:
+            continue
+        cleaned = (value or "").strip().strip('"')
+        if cleaned:
+            names.append(cleaned)
+    return names
 
 
 def build_results_kb(books: list[Book], catalog: Catalog, offset: int) -> InlineKeyboardMarkup:
@@ -79,6 +91,28 @@ def results_text(query: str, books: list[Book], catalog: Catalog, offset: int) -
     )
 
 
+def start_text(is_admin: bool) -> str:
+    text = (
+        "Пришлите название книги или фамилию автора — найду в индексе Flibusta и пришлю FB2.\n"
+        "Команды: /start, /help, /stats"
+    )
+    if is_admin:
+        text += (
+            "\n\nАдмин-команды:\n"
+            "/add @username — выдать доступ\n"
+            "/del @username — забрать доступ\n"
+            "/users — список пользователей"
+        )
+    return text
+
+
+async def require_admin(message: Message, access: Access) -> bool:
+    if access.is_admin(message.from_user):
+        return True
+    await message.answer("Эта команда только для администраторов.")
+    return False
+
+
 async def main() -> None:
     token = env("TELEGRAM_BOT_API", "TELEGRAM_BOT_TOKEN")
     if not token:
@@ -87,32 +121,33 @@ async def main() -> None:
     library_dir = Path(env("LIBRARY_DIR", default="/books") or "/books")
     index_name = env("INDEX_FILE", default="flibusta_fb2_local.inpx") or "flibusta_fb2_local.inpx"
     index_path = library_dir / index_name
-    db_path = Path(env("DATA_DIR", default="/data") or "/data") / "catalog.sqlite"
-    proxy = env("SOCKS_PROXY", default="socks5://proxy:1080")
+    data_dir = Path(env("DATA_DIR", default="/data") or "/data")
+    db_path = data_dir / "catalog.sqlite"
+    vpn_url = env("VLESS_URL", "VPN_URL")
+    proxy = env("SOCKS_PROXY", default="socks5://proxy:1080") if vpn_url else None
 
     catalog = Catalog(library_dir=library_dir, db_path=db_path, index_path=index_path)
+    access = Access(db_path=data_dir / "access.sqlite", admin_usernames=collect_admins())
+    if not access.admins:
+        log.warning("No admin usernames configured; nobody can grant access")
 
-    session = AiohttpSession(proxy=proxy)
+    session = AiohttpSession(proxy=proxy) if proxy else AiohttpSession()
     bot = Bot(
         token=token,
         session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
+    dp.message.middleware(AccessMiddleware(access))
+    dp.callback_query.middleware(AccessMiddleware(access))
 
     @dp.message(CommandStart())
     async def start(message: Message) -> None:
-        await message.answer(
-            "Пришлите название книги или фамилию автора — найду в индексе Flibusta и пришлю FB2.\n"
-            "Команды: /start, /help, /stats"
-        )
+        await message.answer(start_text(access.is_admin(message.from_user)))
 
     @dp.message(Command("help"))
     async def help_cmd(message: Message) -> None:
-        await message.answer(
-            "Поиск по названию, автору и серии.\n"
-            "Нажмите на книгу в списке, чтобы получить файл из zip-архива."
-        )
+        await message.answer(start_text(access.is_admin(message.from_user)))
 
     @dp.message(Command("stats"))
     async def stats_cmd(message: Message) -> None:
@@ -131,6 +166,42 @@ async def main() -> None:
             f"Скачанных архивов: {len(archives)}\n"
             f"Книг, которые можно выдать сейчас: {local}"
         )
+
+    @dp.message(Command("add", "adduser"))
+    async def add_user(message: Message, command: CommandObject) -> None:
+        if not await require_admin(message, access):
+            return
+        username = parse_username_arg(command.args)
+        if not username:
+            await message.answer("Использование: /add @username")
+            return
+        access.add(username, message.from_user.username or "")
+        await message.answer(f"Доступ выдан: @{username}")
+
+    @dp.message(Command("del", "deluser", "remove"))
+    async def del_user(message: Message, command: CommandObject) -> None:
+        if not await require_admin(message, access):
+            return
+        username = parse_username_arg(command.args)
+        if not username:
+            await message.answer("Использование: /del @username")
+            return
+        if username in access.admins:
+            await message.answer("Нельзя забрать доступ у администратора из .env")
+            return
+        if access.remove(username):
+            await message.answer(f"Доступ отозван: @{username}")
+        else:
+            await message.answer(f"Пользователь @{username} не найден в списке")
+
+    @dp.message(Command("users"))
+    async def list_users(message: Message) -> None:
+        if not await require_admin(message, access):
+            return
+        admins = ", ".join(f"@{name}" for name in sorted(access.admins)) or "—"
+        allowed = access.list_users()
+        users = "\n".join(f"@{name}" for name in allowed) if allowed else "пока никого"
+        await message.answer(f"Админы: {admins}\n\nДопущенные пользователи:\n{users}")
 
     @dp.message(F.text)
     async def search_msg(message: Message) -> None:
@@ -194,7 +265,12 @@ async def main() -> None:
             document, caption=html.escape(book.caption())[:1024]
         )
 
-    log.info("Starting bot, library=%s proxy=%s", library_dir, proxy)
+    log.info(
+        "Starting bot, library=%s proxy=%s admins=%s",
+        library_dir,
+        proxy or "disabled",
+        ",".join(sorted(access.admins)) or "none",
+    )
     await dp.start_polling(bot)
 
 
